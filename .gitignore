@@ -7,3 +7,6 @@ Cargo.lock
 .env
 .env.*
 !.env.example
+
+# Torii local config
+.torii/
