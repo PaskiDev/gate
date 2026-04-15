@@ -11,7 +11,12 @@ repository = "https://gitlab.com/paskidev/gate"
 name = "gate"
 path = "src/lib.rs"
 
+[[bin]]
+name = "gate"
+path = "src/main.rs"
+
 [dependencies]
 thiserror = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 
 [dev-dependencies]
