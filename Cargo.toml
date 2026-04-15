@@ -1,0 +1,17 @@
+[package]
+name = "gate-lang"
+version = "0.1.0"
+edition = "2021"
+authors = ["Paski <paski@paski.dev>"]
+description = "Gate — a domain-specific language for version control workflows"
+license = "MIT"
+repository = "https://gitlab.com/paskidev/gate"
+
+[lib]
+name = "gate"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "1.0"
+
+[dev-dependencies]
