@@ -65,35 +65,86 @@ impl fmt::Display for RuntimeError {
 
 type Result<T> = std::result::Result<T, RuntimeError>;
 
-// Control-flow signals
-enum Signal {
+/// Internal control-flow signal. `Return` carries an optional value so callers
+/// can capture `return expr` results without parsing magic strings.
+#[derive(Debug, Clone)]
+pub enum Signal {
     Return(Option<Value>),
 }
+
+/// Errors that may flow through interpreter — either a real runtime error or
+/// a control-flow signal (return, break, continue in the future).
+#[derive(Debug, Clone)]
+pub enum Flow {
+    Error(RuntimeError),
+    Signal(Signal),
+}
+
+impl From<RuntimeError> for Flow {
+    fn from(e: RuntimeError) -> Self { Flow::Error(e) }
+}
+
+type FlowResult<T> = std::result::Result<T, Flow>;
 
 // ---------------------------------------------------------------------------
 // Environment (scoped variable store)
 // ---------------------------------------------------------------------------
 
+/// Lexically scoped environment. Implemented as a stack of frames so an inner
+/// scope (if/for/block) can read+write variables that live in any outer frame
+/// without cloning the parent — assignments to existing names update the frame
+/// where they were originally defined.
 #[derive(Debug, Clone, Default)]
 pub struct Env {
-    vars: HashMap<String, Value>,
-    parent: Option<Box<Env>>,
+    frames: Vec<HashMap<String, Value>>,
 }
 
 impl Env {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self { frames: vec![HashMap::new()] }
+    }
 
-    pub fn child(parent: Env) -> Self {
-        Self { vars: HashMap::new(), parent: Some(Box::new(parent)) }
+    pub fn push_scope(&mut self) {
+        self.frames.push(HashMap::new());
+    }
+
+    pub fn pop_scope(&mut self) {
+        if self.frames.len() > 1 {
+            self.frames.pop();
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<&Value> {
-        self.vars.get(name).or_else(|| self.parent.as_ref()?.get(name))
+        for frame in self.frames.iter().rev() {
+            if let Some(v) = frame.get(name) { return Some(v); }
+        }
+        None
     }
 
+    /// Set a variable. If `name` already exists in any outer frame, update it
+    /// in place. Otherwise create it in the innermost frame.
     pub fn set(&mut self, name: String, value: Value) {
-        self.vars.insert(name, value);
+        for frame in self.frames.iter_mut().rev() {
+            if frame.contains_key(&name) {
+                frame.insert(name, value);
+                return;
+            }
+        }
+        if let Some(top) = self.frames.last_mut() {
+            top.insert(name, value);
+        }
     }
+
+    /// Force-set a variable in the innermost frame (for loop bindings).
+    pub fn set_local(&mut self, name: String, value: Value) {
+        if let Some(top) = self.frames.last_mut() {
+            top.insert(name, value);
+        }
+    }
+
+    /// Backwards-compat shim used by older code paths.
+    #[deprecated(note = "use push_scope/pop_scope instead")]
+    pub fn child(parent: Env) -> Self { parent }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,18 +185,29 @@ impl Interpreter {
         }
     }
 
-    /// Run a named workflow with positional arguments
+    /// Run a named workflow with positional arguments. Returns the value of a
+    /// top-level `return expr` if the workflow used one, otherwise None.
     pub fn run(&mut self, name: &str, args: Vec<Value>) -> Result<Option<Value>> {
+        self.run_with_named(name, args, &[])
+    }
+
+    /// Run a named workflow with positional + named arguments. Named args take
+    /// precedence over positionals when both reference the same parameter.
+    pub fn run_with_named(
+        &mut self,
+        name: &str,
+        positional: Vec<Value>,
+        named: &[(String, Value)],
+    ) -> Result<Option<Value>> {
         let wf = self.workflows.get(name)
             .ok_or_else(|| RuntimeError(format!("workflow '{}' not found", name)))?
             .clone();
 
         let mut env = Env::new();
 
-        // Bind params
         for (i, param) in wf.params.iter().enumerate() {
-            let val = args.get(i)
-                .cloned()
+            let val = named.iter().find(|(k, _)| k == &param.name).map(|(_, v)| v.clone())
+                .or_else(|| positional.get(i).cloned())
                 .or_else(|| {
                     param.default.as_ref().and_then(|d| {
                         let mut tmp_env = Env::new();
@@ -153,21 +215,23 @@ impl Interpreter {
                     })
                 })
                 .unwrap_or(Value::Null);
-            env.set(param.name.clone(), val);
+            env.set_local(param.name.clone(), val);
         }
 
         match self.exec_block(&wf.body, &mut env) {
             Ok(()) => Ok(None),
-            Err(e) if e.0.starts_with("__return__:") => {
-                // Encoded return value
-                Ok(None) // simplified: return values handled via Signal
-            }
-            Err(e) => {
-                // Try on_error handler
+            Err(Flow::Signal(Signal::Return(val))) => Ok(val),
+            Err(Flow::Error(e)) => {
                 if let Some(handler) = &wf.body.on_error.clone() {
                     eprintln!("⚠️  Error in workflow '{}': {}", name, e);
-                    let mut err_env = Env::child(env);
-                    self.exec_block(handler, &mut err_env)?;
+                    env.push_scope();
+                    let handler_result = self.exec_block(handler, &mut env);
+                    env.pop_scope();
+                    match handler_result {
+                        Ok(()) => {}
+                        Err(Flow::Signal(Signal::Return(_))) => {}
+                        Err(Flow::Error(handler_err)) => return Err(handler_err),
+                    }
                 }
                 Err(e)
             }
@@ -178,18 +242,14 @@ impl Interpreter {
     // Block execution
     // -----------------------------------------------------------------------
 
-    fn exec_block(&mut self, block: &Block, env: &mut Env) -> Result<()> {
+    fn exec_block(&mut self, block: &Block, env: &mut Env) -> FlowResult<()> {
         for stmt in &block.stmts {
             self.exec_stmt(stmt, env)?;
         }
         Ok(())
     }
 
-    // -----------------------------------------------------------------------
-    // Statement execution
-    // -----------------------------------------------------------------------
-
-    fn exec_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> Result<()> {
+    fn exec_stmt(&mut self, stmt: &Stmt, env: &mut Env) -> FlowResult<()> {
         match stmt {
             Stmt::Assign(a) => {
                 let val = self.eval_expr(&a.value, env)?;
@@ -199,26 +259,27 @@ impl Interpreter {
                 self.eval_expr(e, env)?;
             }
             Stmt::Return(e) => {
-                let _val = e.as_ref().map(|ex| self.eval_expr(ex, env)).transpose()?;
-                return Err(RuntimeError("__return__".to_string()));
+                let val = e.as_ref().map(|ex| self.eval_expr(ex, env)).transpose()?;
+                return Err(Flow::Signal(Signal::Return(val)));
             }
             Stmt::If(i) => {
+                // No new scope — variables assigned inside if/else persist
+                // (matches Python/JS-let semantics for control-flow blocks).
                 let cond = self.eval_expr(&i.condition, env)?;
                 if is_truthy(&cond) {
-                    let mut child = Env::child(env.clone());
-                    self.exec_block(&i.then_block, &mut child)?;
+                    self.exec_block(&i.then_block, env)?;
                 } else if let Some(else_b) = &i.else_block {
-                    let mut child = Env::child(env.clone());
-                    self.exec_block(else_b, &mut child)?;
+                    self.exec_block(else_b, env)?;
                 }
             }
             Stmt::For(f) => {
+                // For-loop variable lives in the workflow scope so it's still
+                // readable after the loop completes (last value bound).
                 let iterable = self.eval_expr(&f.iterable, env)?;
                 let items = coerce_to_list(iterable);
                 for item in items {
-                    let mut child = Env::child(env.clone());
-                    child.set(f.var.clone(), item);
-                    self.exec_block(&f.body, &mut child)?;
+                    env.set(f.var.clone(), item);
+                    self.exec_block(&f.body, env)?;
                 }
             }
         }
@@ -239,8 +300,20 @@ impl Interpreter {
             Expr::DurationLit(v, u)  => Ok(Value::Duration(*v, u.clone())),
 
             Expr::Ident(name) => {
-                env.get(name).cloned()
-                    .ok_or_else(|| RuntimeError(format!("undefined variable '{}'", name)))
+                // Builtin namespaces are resolved as marker strings so method
+                // dispatch (`tag.release`, `mirror.sync`, …) works without the
+                // user defining them. Real variables shadow these.
+                if let Some(v) = env.get(name) {
+                    return Ok(v.clone());
+                }
+                if is_builtin_namespace(name) {
+                    return Ok(Value::String(name.to_string()));
+                }
+                // Treat enum/struct names as marker strings for downstream calls
+                if self.enums.contains_key(name) || self.structs.contains_key(name) {
+                    return Ok(Value::String(name.to_string()));
+                }
+                Err(RuntimeError(format!("undefined variable '{}'", name)))
             }
 
             Expr::List(items) => {
@@ -336,10 +409,27 @@ impl Interpreter {
     // -----------------------------------------------------------------------
 
     fn eval_call(&mut self, call: &CallExpr, env: &mut Env) -> Result<Value> {
-        // Resolve callee
         match call.callee.as_ref() {
             Expr::Ident(name) => self.call_builtin_or_workflow(name, &call.args, env),
             Expr::Member(obj, method) => {
+                // Mutating list methods need to update the variable in place
+                // when the receiver is a plain identifier.
+                if matches!(method.as_str(), "push") {
+                    if let Expr::Ident(var_name) = obj.as_ref() {
+                        let positional = self.eval_positional(&call.args, env)?;
+                        let current = env.get(var_name).cloned()
+                            .ok_or_else(|| RuntimeError(format!("undefined variable '{}'", var_name)))?;
+                        if let Value::List(mut items) = current {
+                            if let Some(v) = positional.into_iter().next() {
+                                items.push(v);
+                            }
+                            let updated = Value::List(items);
+                            env.set(var_name.clone(), updated.clone());
+                            return Ok(updated);
+                        }
+                    }
+                }
+
                 let obj_val = self.eval_expr(obj, env)?;
                 self.call_method(obj_val, method, &call.args, env)
             }
@@ -350,26 +440,34 @@ impl Interpreter {
         }
     }
 
-    fn eval_args(&mut self, args: &[Arg], env: &mut Env) -> Result<Vec<Value>> {
-        args.iter().map(|a| match a {
-            Arg::Positional(e) => self.eval_expr(e, env),
-            Arg::Named(_, e)   => self.eval_expr(e, env),
+    fn eval_positional(&mut self, args: &[Arg], env: &mut Env) -> Result<Vec<Value>> {
+        args.iter().filter_map(|a| match a {
+            Arg::Positional(e) => Some(self.eval_expr(e, env)),
+            Arg::Named(_, _)   => None,
+        }).collect()
+    }
+
+    fn eval_named(&mut self, args: &[Arg], env: &mut Env) -> Result<Vec<(String, Value)>> {
+        args.iter().filter_map(|a| match a {
+            Arg::Named(k, e) => Some(self.eval_expr(e, env).map(|v| (k.clone(), v))),
+            Arg::Positional(_) => None,
         }).collect()
     }
 
     fn call_builtin_or_workflow(&mut self, name: &str, args: &[Arg], env: &mut Env) -> Result<Value> {
-        let vals = self.eval_args(args, env)?;
+        let positional = self.eval_positional(args, env)?;
+        let named = self.eval_named(args, env)?;
 
         match name {
             // --- I/O ---
             "print" => {
-                let msg = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                let msg = positional.first().map(|v| v.to_string()).unwrap_or_default();
                 println!("{}", msg);
                 self.output.push(msg);
                 Ok(Value::Null)
             }
             "input" => {
-                let prompt = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                let prompt = positional.first().map(|v| v.to_string()).unwrap_or_default();
                 print!("{}: ", prompt);
                 use std::io::Write;
                 std::io::stdout().flush().ok();
@@ -378,7 +476,7 @@ impl Interpreter {
                 Ok(Value::String(line.trim().to_string()))
             }
             "confirm" => {
-                let prompt = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                let prompt = positional.first().map(|v| v.to_string()).unwrap_or_default();
                 print!("{} [y/N] ", prompt);
                 use std::io::Write;
                 std::io::stdout().flush().ok();
@@ -391,30 +489,45 @@ impl Interpreter {
                 Ok(Value::Bool(true))
             }
             "notify" => {
-                let msg = vals.first().map(|v| v.to_string()).unwrap_or_default();
-                self.run_torii(&["notify", &msg])?;
+                // torii has no `notify` subcommand — surface the message instead.
+                let msg = positional.first().map(|v| v.to_string()).unwrap_or_default();
+                println!("[notify] {}", msg);
+                self.output.push(format!("[notify] {}", msg));
                 Ok(Value::Null)
             }
 
             // --- Core torii commands ---
             "save" => {
-                let msg = vals.first().map(|v| v.to_string()).unwrap_or_default();
-                self.run_torii(&["save", "-am", &msg])?;
+                let msg = positional.first().map(|v| v.to_string()).unwrap_or_default();
+                let all   = lookup_named_bool(&named, "all").unwrap_or(false);
+                let amend = lookup_named_bool(&named, "amend").unwrap_or(false);
+                let mut argv: Vec<String> = vec!["save".to_string()];
+                if all   { argv.push("-a".to_string()); }
+                if amend { argv.push("--amend".to_string()); }
+                argv.push("-m".to_string());
+                argv.push(msg);
+                let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+                self.run_torii(&argv_ref)?;
                 Ok(Value::Null)
             }
             "sync" => {
-                let force = named_bool(args, "push").unwrap_or(false);
-                if force {
-                    self.run_torii(&["sync", "--push"])?;
-                } else {
-                    self.run_torii(&["sync"])?;
-                }
+                let push  = lookup_named_bool(&named, "push").unwrap_or(false);
+                let pull  = lookup_named_bool(&named, "pull").unwrap_or(false);
+                let force = lookup_named_bool(&named, "force").unwrap_or(false);
+                let fetch = lookup_named_bool(&named, "fetch").unwrap_or(false);
+                let mut argv: Vec<String> = vec!["sync".to_string()];
+                if force { argv.push("--force".to_string()); }
+                else if fetch { argv.push("--fetch".to_string()); }
+                else if push  { argv.push("--push".to_string()); }
+                else if pull  { argv.push("--pull".to_string()); }
+                let argv_ref: Vec<&str> = argv.iter().map(|s| s.as_str()).collect();
+                self.run_torii(&argv_ref)?;
                 Ok(Value::Null)
             }
 
             // --- User-defined workflow ---
             _ if self.workflows.contains_key(name) => {
-                let result = self.run(name, vals)?;
+                let result = self.run_with_named(name, positional, &named)?;
                 Ok(result.unwrap_or(Value::Null))
             }
 
@@ -423,10 +536,10 @@ impl Interpreter {
     }
 
     fn call_method(&mut self, obj: Value, method: &str, args: &[Arg], env: &mut Env) -> Result<Value> {
-        let vals = self.eval_args(args, env)?;
+        let vals = self.eval_positional(args, env)?;
 
         match (&obj, method) {
-            // snapshot.create / restore / list
+            // snapshot.create / restore / list / delete
             (Value::String(ns), "create") if ns == "snapshot" => {
                 let name = vals.first().map(|v| v.to_string()).unwrap_or_default();
                 self.run_torii(&["snapshot", "create", "-n", &name])?;
@@ -437,52 +550,139 @@ impl Interpreter {
                 self.run_torii(&["snapshot", "restore", &id])?;
                 Ok(Value::Null)
             }
-            // mirror.sync
+            (Value::String(ns), "list") if ns == "snapshot" => {
+                self.run_torii(&["snapshot", "list"])?;
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "delete") if ns == "snapshot" => {
+                let id = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                self.run_torii(&["snapshot", "delete", &id])?;
+                Ok(Value::Null)
+            }
+
+            // mirror.sync / mirror.list
             (Value::String(ns), "sync") if ns == "mirror" => {
                 self.run_torii(&["mirror", "sync"])?;
                 Ok(Value::Null)
             }
-            // tag.release / tag.create
+            (Value::String(ns), "list") if ns == "mirror" => {
+                self.run_torii(&["mirror", "list"])?;
+                Ok(Value::Null)
+            }
+
+            // tag.create / tag.release / tag.list / tag.push / tag.delete
+            // Note: torii v0.3.5+ moved `tag release` under `tag create --release`.
+            (Value::String(ns), "create") if ns == "tag" => {
+                let name = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                self.run_torii(&["tag", "create", &name])?;
+                Ok(Value::Null)
+            }
             (Value::String(ns), "release") if ns == "tag" => {
                 if let Some(v) = vals.first() {
-                    self.run_torii(&["tag", "release", "--bump", &v.to_string()])?;
+                    let bump = v.to_string();
+                    self.run_torii(&["tag", "create", "--release", "--bump", &bump])?;
                 } else {
-                    self.run_torii(&["tag", "release"])?;
+                    self.run_torii(&["tag", "create", "--release"])?;
                 }
                 Ok(Value::Null)
             }
-            // semver.bump
+            (Value::String(ns), "list") if ns == "tag" => {
+                self.run_torii(&["tag", "list"])?;
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "push") if ns == "tag" => {
+                let name = vals.first().map(|v| v.to_string());
+                if let Some(n) = name {
+                    self.run_torii(&["tag", "push", &n])?;
+                } else {
+                    self.run_torii(&["tag", "push"])?;
+                }
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "delete") if ns == "tag" => {
+                let name = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                self.run_torii(&["tag", "delete", &name])?;
+                Ok(Value::Null)
+            }
+
+            // semver.bump — dry-run preview, returns the next version string
             (Value::String(ns), "bump") if ns == "semver" => {
                 let kind = vals.first().map(|v| v.to_string()).unwrap_or("minor".to_string());
-                self.run_torii(&["tag", "release", "--bump", &kind, "--dry-run"])?;
+                self.run_torii(&["tag", "create", "--release", "--bump", &kind, "--dry-run"])?;
                 Ok(Value::String(format!("bumped-{}", kind)))
             }
+
+            // branch.create / switch / delete / list / rename
+            (Value::String(ns), "create") if ns == "branch" => {
+                let name = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                self.run_torii(&["branch", &name, "-c"])?;
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "switch") if ns == "branch" => {
+                let name = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                self.run_torii(&["branch", &name])?;
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "delete") if ns == "branch" => {
+                let name = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                self.run_torii(&["branch", "-d", &name])?;
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "list") if ns == "branch" => {
+                self.run_torii(&["branch", "--list"])?;
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "rename") if ns == "branch" => {
+                let new_name = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                self.run_torii(&["branch", "--rename", &new_name])?;
+                Ok(Value::Null)
+            }
+
+            // scan.staged / scan.history
+            (Value::String(ns), "staged") if ns == "scan" => {
+                self.run_torii(&["scan"])?;
+                Ok(Value::Null)
+            }
+            (Value::String(ns), "history") if ns == "scan" => {
+                self.run_torii(&["scan", "--history"])?;
+                Ok(Value::Null)
+            }
+
             // notify.to / notify.channel
             (Value::String(ns), "to") if ns == "notify" => {
                 let channel = vals.first().map(|v| v.to_string()).unwrap_or_default();
                 let msg = vals.get(1).map(|v| v.to_string()).unwrap_or_default();
                 println!("[notify → {}] {}", channel, msg);
+                self.output.push(format!("[notify → {}] {}", channel, msg));
                 Ok(Value::Null)
             }
             (Value::String(ns), "channel") if ns == "notify" => {
-                println!("[notify.channel configured]");
+                let name = vals.first().map(|v| v.to_string()).unwrap_or_default();
+                let target = vals.get(1).map(|v| v.to_string()).unwrap_or_default();
+                println!("[notify.channel configured: {} → {}]", name, target);
                 Ok(Value::Null)
             }
+
             // string methods
             (Value::String(s), "matches") => {
                 let pattern = vals.first().map(|v| v.to_string()).unwrap_or_default();
                 Ok(Value::Bool(s.contains(&pattern)))
             }
             (Value::String(s), "len") => Ok(Value::Number(s.len() as f64)),
-            // list methods
+            (Value::String(s), "upper") => Ok(Value::String(s.to_uppercase())),
+            (Value::String(s), "lower") => Ok(Value::String(s.to_lowercase())),
+            (Value::String(s), "trim")  => Ok(Value::String(s.trim().to_string())),
+
+            // list methods (non-mutating fallback — `push` mutating path is in eval_call)
             (Value::List(items), "push") => {
                 let mut new_items = items.clone();
-                if let Some(v) = vals.first() {
-                    new_items.push(v.clone());
-                }
+                if let Some(v) = vals.first() { new_items.push(v.clone()); }
                 Ok(Value::List(new_items))
             }
-            (Value::List(items), "len") => Ok(Value::Number(items.len() as f64)),
+            (Value::List(items), "len")   => Ok(Value::Number(items.len() as f64)),
+            (Value::List(items), "first") => Ok(items.first().cloned().unwrap_or(Value::Null)),
+            (Value::List(items), "last")  => Ok(items.last().cloned().unwrap_or(Value::Null)),
+
             _ => Err(RuntimeError(format!("unknown method '{}'", method))),
         }
     }
@@ -585,7 +785,9 @@ fn values_eq(a: &Value, b: &Value) -> bool {
     }
 }
 
-/// Resolve {var} placeholders in string literals
+/// Resolve `{expr}` placeholders in string literals. Supports plain identifiers
+/// (`{name}`) and dotted member access (`{config.env}`, `{user.profile.name}`).
+/// Anything more complex (calls, arithmetic) is left as literal text — for now.
 fn interpolate(template: &str, env: &Env) -> String {
     let mut result = String::new();
     let mut chars = template.chars().peekable();
@@ -597,9 +799,10 @@ fn interpolate(template: &str, env: &Env) -> String {
                 if inner == '}' { break; }
                 name.push(inner);
             }
-            let val = env.get(name.trim())
+            let trimmed = name.trim();
+            let val = resolve_path(trimmed, env)
                 .map(|v| v.to_string())
-                .unwrap_or_else(|| format!("{{{}}}", name));
+                .unwrap_or_else(|| format!("{{{}}}", trimmed));
             result.push_str(&val);
         } else {
             result.push(ch);
@@ -609,14 +812,44 @@ fn interpolate(template: &str, env: &Env) -> String {
     result
 }
 
-/// Extract a named boolean argument from arg list
-fn named_bool(args: &[Arg], key: &str) -> Option<bool> {
-    for arg in args {
-        if let Arg::Named(k, Expr::BoolLit(b)) = arg {
-            if k == key { return Some(*b); }
-        }
+/// Walk a dotted path (`a.b.c`) through nested struct/map values.
+fn resolve_path(path: &str, env: &Env) -> Option<Value> {
+    let mut parts = path.split('.');
+    let head = parts.next()?;
+    let mut cur = env.get(head.trim())?.clone();
+    for seg in parts {
+        let seg = seg.trim();
+        cur = match cur {
+            Value::StructInstance(_, fields) => fields.get(seg).cloned()?,
+            Value::Map(m)                    => m.get(seg).cloned()?,
+            _ => return None,
+        };
     }
-    None
+    Some(cur)
+}
+
+/// Names that resolve as builtin namespace markers when used as bare idents.
+/// Method dispatch (e.g. `tag.release(...)`) handles the actual behavior.
+fn is_builtin_namespace(name: &str) -> bool {
+    matches!(
+        name,
+        "tag" | "mirror" | "snapshot" | "branch" | "scan"
+            | "history" | "remote" | "notify" | "semver" | "repo"
+    )
+}
+
+/// Find the boolean value of a named argument that has already been evaluated.
+fn lookup_named_bool(named: &[(String, Value)], key: &str) -> Option<bool> {
+    named.iter().find(|(k, _)| k == key).and_then(|(_, v)| match v {
+        Value::Bool(b) => Some(*b),
+        _ => None,
+    })
+}
+
+/// Find a named argument's evaluated value (any type).
+#[allow(dead_code)]
+fn lookup_named<'a>(named: &'a [(String, Value)], key: &str) -> Option<&'a Value> {
+    named.iter().find(|(k, _)| k == key).map(|(_, v)| v)
 }
 
 // ---------------------------------------------------------------------------
@@ -724,5 +957,151 @@ workflow deploy() {
 "#, "deploy");
         // dry_run = true so torii is not actually called, no error
         let _ = interp;
+    }
+
+    // -----------------------------------------------------------------
+    // Regression tests for fixes (B1/B2/B6/B7/B9/B10/B4)
+    // -----------------------------------------------------------------
+
+    fn run_capture(src: &str, workflow: &str) -> Result<Option<Value>> {
+        let mut lexer = Lexer::new(src);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.dry_run = true;
+        interp.load(program);
+        interp.run(workflow, vec![])
+    }
+
+    /// B1+B2: `return expr` actually carries the value back to the caller.
+    #[test]
+    fn test_return_value() {
+        let result = run_capture(r#"
+workflow get() {
+    return 42
+}
+"#, "get").unwrap();
+        match result {
+            Some(Value::Number(n)) => assert_eq!(n, 42.0),
+            other => panic!("expected Number(42), got {:?}", other),
+        }
+    }
+
+    /// B1+B2: workflow A calls workflow B that returns a value — A captures it.
+    #[test]
+    fn test_return_value_propagates_to_caller() {
+        let mut lexer = Lexer::new(r#"
+workflow inner() {
+    return "hello"
+}
+
+workflow outer() {
+    msg = inner()
+    print(msg)
+}
+"#);
+        let tokens = lexer.tokenize().unwrap();
+        let mut parser = Parser::new(tokens);
+        let program = parser.parse().unwrap();
+        let mut interp = Interpreter::new();
+        interp.dry_run = true;
+        interp.load(program);
+        interp.run("outer", vec![]).unwrap();
+        assert_eq!(interp.output(), &["hello"]);
+    }
+
+    /// B9: variables assigned inside an `if` block remain visible afterwards.
+    #[test]
+    fn test_if_scope_persists() {
+        let interp = run(r#"
+workflow check() {
+    if true {
+        result = "found"
+    }
+    print(result)
+}
+"#, "check");
+        assert_eq!(interp.output(), &["found"]);
+    }
+
+    /// B9: variables assigned inside a `for` body remain visible afterwards.
+    #[test]
+    fn test_for_scope_persists() {
+        let interp = run(r#"
+workflow loop() {
+    last = "none"
+    for x in ["a", "b", "c"] {
+        last = x
+    }
+    print(last)
+}
+"#, "loop");
+        assert_eq!(interp.output(), &["c"]);
+    }
+
+    /// B10: `list.push` mutates the binding when called on an identifier.
+    #[test]
+    fn test_list_push_mutates() {
+        let interp = run(r#"
+workflow build() {
+    items = []
+    items.push("a")
+    items.push("b")
+    items.push("c")
+    for x in items {
+        print(x)
+    }
+}
+"#, "build");
+        assert_eq!(interp.output(), &["a", "b", "c"]);
+    }
+
+    /// B4: workflow accepts named arguments and routes them to params.
+    #[test]
+    fn test_workflow_named_args() {
+        let interp = run(r#"
+workflow greet(first, last) {
+    print("{first} {last}")
+}
+
+workflow main() {
+    greet(last: "Doe", first: "Jane")
+}
+"#, "main");
+        assert_eq!(interp.output(), &["Jane Doe"]);
+    }
+
+    /// Workflow defaults still apply when neither positional nor named is passed.
+    #[test]
+    fn test_workflow_param_default() {
+        let interp = run(r#"
+workflow greet(name = "world") {
+    print("Hello, {name}!")
+}
+
+workflow main() {
+    greet()
+}
+"#, "main");
+        assert_eq!(interp.output(), &["Hello, world!"]);
+    }
+
+    /// Calling `return` inside a nested if still returns from the workflow.
+    #[test]
+    fn test_return_from_nested_block() {
+        let result = run_capture(r#"
+workflow get() {
+    x = 5
+    if x > 0 {
+        return "positive"
+    }
+    return "non-positive"
+}
+"#, "get").unwrap();
+        match result {
+            Some(Value::String(s)) => assert_eq!(s, "positive"),
+            other => panic!("expected String, got {:?}", other),
+        }
     }
 }

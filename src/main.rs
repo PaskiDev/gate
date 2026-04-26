@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
-use gate::gate::{lexer::Lexer, parser::Parser as GateParser, interpreter::Interpreter};
+use gate::gate::{lexer::Lexer, parser::Parser as GateParser, interpreter::{Interpreter, Value}};
 
 #[derive(Parser)]
 #[command(name = "gate")]
@@ -60,19 +60,10 @@ fn run(cli: Cli) -> Result<(), String> {
             interp.dry_run = dry_run;
             interp.load(program);
 
-            // Parse key=value args into positional values
-            let values: Vec<gate::gate::interpreter::Value> = args.iter()
-                .map(|a| {
-                    if let Some((_, v)) = a.split_once('=') {
-                        gate::gate::interpreter::Value::String(v.to_string())
-                    } else {
-                        gate::gate::interpreter::Value::String(a.clone())
-                    }
-                })
-                .collect();
+            let (positional, named) = parse_run_args(&args);
 
             println!("▶  Running workflow '{}'...\n", workflow);
-            interp.run(&workflow, values)
+            interp.run_with_named(&workflow, positional, &named)
                 .map_err(|e| e.to_string())?;
             println!("\n✅ Done");
             Ok(())
@@ -112,6 +103,27 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// Split user-supplied workflow args into positional values and `key=value`
+/// named values. Bare tokens become positional strings; `key=value` becomes a
+/// named binding for that workflow parameter. Values keep string form — the
+/// interpreter coerces where needed (numbers, bools, etc. require explicit
+/// args inside `.gate` files for now).
+fn parse_run_args(args: &[String]) -> (Vec<Value>, Vec<(String, Value)>) {
+    let mut positional = Vec::new();
+    let mut named = Vec::new();
+    for arg in args {
+        if let Some((k, v)) = arg.split_once('=') {
+            let k = k.trim();
+            if !k.is_empty() && k.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                named.push((k.to_string(), Value::String(v.to_string())));
+                continue;
+            }
+        }
+        positional.push(Value::String(arg.clone()));
+    }
+    (positional, named)
 }
 
 fn read_file(path: &PathBuf) -> Result<String, String> {

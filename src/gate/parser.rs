@@ -447,13 +447,14 @@ impl Parser {
         let mut args = Vec::new();
 
         while self.current() != Token::RParen && !self.is_eof() {
-            // named arg: name: value
-            if let Token::Ident(n) = self.current().clone() {
-                if self.peek_next() == Token::Colon {
-                    self.advance(); // ident
+            // named arg: name: value — name can be an identifier OR a few keywords
+            // that are also valid parameter names (all, timeout, in).
+            if self.peek_next() == Token::Colon {
+                if let Some(name) = arg_name_from_token(&self.current()) {
+                    self.advance(); // name token
                     self.advance(); // colon
                     let val = self.parse_expr()?;
-                    args.push(Arg::Named(n, val));
+                    args.push(Arg::Named(name, val));
                     self.eat(Token::Comma);
                     continue;
                 }
@@ -566,6 +567,20 @@ impl Parser {
 
     fn error(&self, message: String) -> ParseError {
         ParseError { message, pos: self.pos }
+    }
+}
+
+/// If the current token can plausibly serve as a named-argument key, return
+/// the spelled-out name. Identifiers always qualify; a few keywords (`all`,
+/// `timeout`, `in`) are common parameter names too and are allowed in this
+/// position.
+fn arg_name_from_token(tok: &Token) -> Option<String> {
+    match tok {
+        Token::Ident(n) => Some(n.clone()),
+        Token::All      => Some("all".to_string()),
+        Token::Timeout  => Some("timeout".to_string()),
+        Token::In       => Some("in".to_string()),
+        _ => None,
     }
 }
 
