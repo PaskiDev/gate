@@ -386,3 +386,7 @@ See [gate-spec.md](gate-spec.md) for the complete language specification.
 Apache 2.0 — see [LICENSE](LICENSE).
 
 Built as part of the [Torii](https://gitorii.com) ecosystem.
+
+## Author
+
+Built by **Pasqual Peñalver Collado** ([PaskiDev](https://paski.dev)) — Lead Full Stack Developer in Barcelona. More projects and devlog at [paski.dev](https://paski.dev).
