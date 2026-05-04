@@ -12,6 +12,42 @@ pub enum Item {
     Struct(StructDecl),
     Impl(ImplDecl),
     Enum(EnumDecl),
+    Policy(PolicyDecl),
+}
+
+/// `policy commits { ... }` — declarative rules consumed by external tools
+/// (torii commit-scan today; CI gates later). Pure data: parser only
+/// validates the shape; semantic checks (regex compile, etc.) happen in the
+/// consumer.
+#[derive(Debug, Clone)]
+pub struct PolicyDecl {
+    pub kind: PolicyKind,
+    pub rules: Vec<PolicyRule>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyKind {
+    Commits,
+}
+
+/// One line inside a `policy commits { ... }` block. Fields hold raw token
+/// payloads; consumer compiles the regex / interprets the limit.
+#[derive(Debug, Clone)]
+pub enum PolicyRule {
+    /// `forbid trailer /regex/`
+    ForbidTrailer(String),
+    /// `require trailer /regex/`
+    RequireTrailer(String),
+    /// `forbid subject /regex/`
+    ForbidSubject(String),
+    /// `author email matches /regex/`
+    AuthorEmailMatches(String),
+    /// `subject max_length 72`
+    SubjectMaxLength(usize),
+    /// `subject min_length 8`
+    SubjectMinLength(usize),
+    /// `conventional_commits required`
+    ConventionalCommitsRequired,
 }
 
 /// import "path/to/file.gate"

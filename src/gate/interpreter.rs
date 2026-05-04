@@ -181,6 +181,7 @@ impl Interpreter {
                 Item::Struct(s)   => { self.structs.insert(s.name.clone(), s); }
                 Item::Impl(_)     => {} // stored with struct (future)
                 Item::Import(_)   => {} // handled by loader (future)
+                Item::Policy(_)   => {} // policies are consumed by external tools (torii commit-scan, CI gates)
             }
         }
     }

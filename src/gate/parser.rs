@@ -46,7 +46,95 @@ impl Parser {
             Token::Struct   => Ok(Item::Struct(self.parse_struct()?)),
             Token::Impl     => Ok(Item::Impl(self.parse_impl()?)),
             Token::Enum     => Ok(Item::Enum(self.parse_enum()?)),
+            Token::Policy   => Ok(Item::Policy(self.parse_policy()?)),
             other => Err(self.error(format!("unexpected token at top level: {:?}", other))),
+        }
+    }
+
+    /// `policy commits { <rule>* }`
+    fn parse_policy(&mut self) -> Result<PolicyDecl, ParseError> {
+        self.expect(Token::Policy)?;
+        let kind = match self.current() {
+            Token::Commits => { self.advance(); PolicyKind::Commits }
+            other => return Err(self.error(format!("unknown policy kind: {:?}", other))),
+        };
+        self.expect(Token::LBrace)?;
+        let mut rules = Vec::new();
+        while self.current() != Token::RBrace && !self.is_eof() {
+            rules.push(self.parse_policy_rule()?);
+            // Optional comma / newlines between rules
+            self.eat(Token::Comma);
+            while self.eat(Token::Newline) {}
+        }
+        self.expect(Token::RBrace)?;
+        Ok(PolicyDecl { kind, rules })
+    }
+
+    fn parse_policy_rule(&mut self) -> Result<PolicyRule, ParseError> {
+        match self.current() {
+            // forbid trailer /regex/
+            // forbid subject /regex/
+            Token::Forbid => {
+                self.advance();
+                match self.current() {
+                    Token::Trailer => {
+                        self.advance();
+                        let pat = self.expect_regex()?;
+                        Ok(PolicyRule::ForbidTrailer(pat))
+                    }
+                    Token::Subject => {
+                        self.advance();
+                        let pat = self.expect_regex()?;
+                        Ok(PolicyRule::ForbidSubject(pat))
+                    }
+                    other => Err(self.error(format!(
+                        "expected `trailer` or `subject` after `forbid`, got {:?}",
+                        other
+                    ))),
+                }
+            }
+            // require trailer /regex/
+            Token::Require => {
+                self.advance();
+                self.expect(Token::Trailer)?;
+                let pat = self.expect_regex()?;
+                Ok(PolicyRule::RequireTrailer(pat))
+            }
+            // author email matches /regex/
+            Token::Author => {
+                self.advance();
+                self.expect(Token::Email)?;
+                self.expect(Token::Matches)?;
+                let pat = self.expect_regex()?;
+                Ok(PolicyRule::AuthorEmailMatches(pat))
+            }
+            // subject max_length N | min_length N
+            Token::Subject => {
+                self.advance();
+                match self.current() {
+                    Token::MaxLength => {
+                        self.advance();
+                        let n = self.expect_number()? as usize;
+                        Ok(PolicyRule::SubjectMaxLength(n))
+                    }
+                    Token::MinLength => {
+                        self.advance();
+                        let n = self.expect_number()? as usize;
+                        Ok(PolicyRule::SubjectMinLength(n))
+                    }
+                    other => Err(self.error(format!(
+                        "expected `max_length` or `min_length` after `subject`, got {:?}",
+                        other
+                    ))),
+                }
+            }
+            // conventional_commits required
+            Token::ConventionalCommits => {
+                self.advance();
+                self.expect(Token::Required)?;
+                Ok(PolicyRule::ConventionalCommitsRequired)
+            }
+            other => Err(self.error(format!("unexpected token in policy body: {:?}", other))),
         }
     }
 
@@ -558,6 +646,25 @@ impl Parser {
         }
     }
 
+    fn expect_regex(&mut self) -> Result<String, ParseError> {
+        match self.current() {
+            Token::RegexLit(s) => { self.advance(); Ok(s) }
+            // Allow string literal as a fallback so users without `/regex/`
+            // syntax can still write rules: `forbid trailer "Co-Authored-By"`.
+            Token::StringLit(s) => { self.advance(); Ok(s) }
+            other => Err(self.error(format!("expected regex literal, got {:?}", other))),
+        }
+    }
+
+    fn expect_number(&mut self) -> Result<f64, ParseError> {
+        if let Token::NumberLit(n) = self.current() {
+            self.advance();
+            Ok(n)
+        } else {
+            Err(self.error(format!("expected number, got {:?}", self.current())))
+        }
+    }
+
     /// Returns true if the current token is an Ident followed by = (not ==)
     fn peek_is_assign(&self) -> bool {
         matches!(self.tokens.get(self.pos + 1), Some(Token::Assign))
@@ -703,5 +810,60 @@ workflow parallel() {
         } else {
             panic!("expected workflow");
         }
+    }
+
+    #[test]
+    fn test_policy_commits_full() {
+        let prog = parse(r#"
+policy commits {
+    forbid trailer /Co-Authored-By:.*Claude/
+    forbid trailer /Co-Authored-By:.*Copilot/
+    require trailer /Signed-off-by:/
+    forbid subject /^(wip|tmp|temp|misc)$/
+    author email matches /.*@paski\.dev$/
+    subject max_length 72
+    subject min_length 8
+    conventional_commits required
+}
+"#);
+        let Item::Policy(p) = &prog.items[0] else {
+            panic!("expected Policy item");
+        };
+        assert_eq!(p.kind, PolicyKind::Commits);
+        assert_eq!(p.rules.len(), 8);
+        assert!(matches!(&p.rules[0], PolicyRule::ForbidTrailer(s) if s.contains("Claude")));
+        assert!(matches!(&p.rules[2], PolicyRule::RequireTrailer(s) if s == "Signed-off-by:"));
+        assert!(matches!(&p.rules[3], PolicyRule::ForbidSubject(_)));
+        assert!(matches!(&p.rules[4], PolicyRule::AuthorEmailMatches(_)));
+        assert!(matches!(&p.rules[5], PolicyRule::SubjectMaxLength(72)));
+        assert!(matches!(&p.rules[6], PolicyRule::SubjectMinLength(8)));
+        assert!(matches!(&p.rules[7], PolicyRule::ConventionalCommitsRequired));
+    }
+
+    #[test]
+    fn test_policy_accepts_string_as_regex() {
+        // Convenience: users without /regex/ syntax can still write rules.
+        let prog = parse(r#"
+policy commits {
+    forbid trailer "Co-Authored-By"
+}
+"#);
+        let Item::Policy(p) = &prog.items[0] else { panic!() };
+        assert!(matches!(&p.rules[0], PolicyRule::ForbidTrailer(s) if s == "Co-Authored-By"));
+    }
+
+    #[test]
+    fn test_policy_empty_block() {
+        let prog = parse("policy commits {}");
+        let Item::Policy(p) = &prog.items[0] else { panic!() };
+        assert!(p.rules.is_empty());
+    }
+
+    #[test]
+    fn test_policy_unknown_kind_errors() {
+        let src = "policy unknown_kind {}";
+        let tokens = crate::gate::lexer::Lexer::new(src).tokenize().unwrap();
+        let mut p = Parser::new(tokens);
+        assert!(p.parse().is_err());
     }
 }
