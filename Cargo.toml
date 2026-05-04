@@ -1,6 +1,6 @@
 [package]
 name = "gate-lang"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 authors = ["Paski <paski@paski.dev>"]
 description = "Gate — a domain-specific language for version control workflows"
